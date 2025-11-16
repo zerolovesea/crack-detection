@@ -1,7 +1,6 @@
 from torch import nn
 from torchvision.models.segmentation import fcn_resnet50
 
-
 class FCNResNet50Binary(nn.Module):
     """
     torchvision 自带的 fcn_resnet50，改成 1 通道二分类输出
@@ -25,10 +24,8 @@ class FCNResNet50Binary(nn.Module):
             in_ch = last_conv.in_channels
             self.net.classifier[-1] = nn.Conv2d(in_ch, 1, kernel_size=1)
         else:
-            # 极少数版本，classifier 可能是别的结构，这里做个防御
             raise RuntimeError(f"未知的 classifier 类型: {type(self.net.classifier)}")
 
-        # 不用 aux 分支就直接关掉
         self.net.aux_classifier = None
 
     def forward(self, x):

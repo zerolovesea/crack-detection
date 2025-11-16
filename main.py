@@ -106,7 +106,7 @@ def main():
 
     img_size = (256, 256)
     batch_size = 4
-    num_epochs = 15
+    num_epochs = 10
     lr = 1e-4          # FCN + ResNet 更大，lr 稍微小一点
     val_ratio = 0.2
     threshold = 0.3
@@ -167,8 +167,8 @@ def main():
 
     # 保存最终模型
     last_ckpt_path = os.path.join(output_dir, "fcn_crack_last.pth")
-    # torch.save(model.state_dict(), last_ckpt_path)
-    # print("最终 FCN 模型已保存到:", last_ckpt_path)
+    torch.save(model.state_dict(), last_ckpt_path)
+    print("最终 FCN 模型已保存到:", last_ckpt_path)
 
     model = FCNResNet50Binary(pretrained=False).to(device)
     model.load_state_dict(torch.load(last_ckpt_path, map_location=device))
