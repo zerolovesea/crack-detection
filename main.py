@@ -1,20 +1,14 @@
 import os
+import argparse
 import torch
 
 from torch import nn
 from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
-from src.dataset import CrackDataset
-from src.model import FCNResNet50Binary
-from src.utils import compute_pos_weight, visualize_predictions
+from src.dataset import CrackDataset, CocoPolygonSegDataset
+from src.model import FCNResNet50
+from src.utils import compute_class_weights, visualize_predictions
 
-
-def dice_loss_with_logits(logits, targets, eps=1e-6):
-    probs = torch.sigmoid(logits)
-    num = 2 * (probs * targets).sum(dim=(1, 2, 3))
-    den = (probs + targets).sum(dim=(1, 2, 3)) + eps
-    dice = num / den
-    return 1 - dice.mean()
 
 def plot_training_curves(train_losses, train_accuracies, val_losses=None, val_accuracies=None, save_dir='./', filename='training_curves.png'):
     """
@@ -68,9 +62,9 @@ def plot_training_curves(train_losses, train_accuracies, val_losses=None, val_ac
     # 显示图像
     plt.show()
 
-def train_one_epoch(model, loader, optimizer, device, pos_weight=None, dice_weight=1.0, bce_weight=1.0, threshold=0.3):
+def train_one_epoch(model, loader, optimizer, device, class_weights=None):
     model.train()
-    bce_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight) if pos_weight is not None else nn.BCEWithLogitsLoss()
+    ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     total_loss = 0.0
     correct_pixels = 0
     total_pixels = 0
@@ -82,10 +76,7 @@ def train_one_epoch(model, loader, optimizer, device, pos_weight=None, dice_weig
         optimizer.zero_grad()
         logits = model(imgs)
 
-        bce = bce_loss_fn(logits, masks)
-        dsl = dice_loss_with_logits(logits, masks)
-
-        loss = bce_weight * bce + dice_weight * dsl
+        loss = ce_loss_fn(logits, masks)
         loss.backward()
         optimizer.step()
 
@@ -93,8 +84,7 @@ def train_one_epoch(model, loader, optimizer, device, pos_weight=None, dice_weig
         
         # 计算准确率
         with torch.no_grad():
-            probs = torch.sigmoid(logits)
-            preds = (probs > threshold).float()
+            preds = torch.argmax(logits, dim=1)
             correct_pixels += (preds == masks).sum().item()
             total_pixels += masks.numel()
 
@@ -103,18 +93,17 @@ def train_one_epoch(model, loader, optimizer, device, pos_weight=None, dice_weig
     return avg_loss, accuracy
 
 
-def evaluate(model, loader, device, pos_weight=None, threshold=0.3):
+def evaluate(model, loader, device, num_classes, class_weights=None):
     model.eval()
-    bce_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight) if pos_weight is not None else nn.BCEWithLogitsLoss()
+    ce_loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     total_loss = 0.0
     correct_pixels = 0
     total_pixels = 0
 
-    total_inter = 0.0
-    total_union = 0.0
-    total_dice_inter = 0.0
-    total_dice_sum = 0.0
-    valid_iou_samples = 0
+    total_inter = torch.zeros(num_classes, device=device)
+    total_union = torch.zeros(num_classes, device=device)
+    total_dice_inter = torch.zeros(num_classes, device=device)
+    total_dice_sum = torch.zeros(num_classes, device=device)
 
     with torch.no_grad():
         for imgs, masks in loader:
@@ -122,64 +111,59 @@ def evaluate(model, loader, device, pos_weight=None, threshold=0.3):
             masks = masks.to(device)
 
             logits = model(imgs)
-            bce = bce_loss_fn(logits, masks)
-            dsl = dice_loss_with_logits(logits, masks)
-            loss = bce + dsl
+            loss = ce_loss_fn(logits, masks)
             total_loss += loss.item() * imgs.size(0)
 
-            probs = torch.sigmoid(logits)
-            preds = (probs > threshold).float()
+            preds = torch.argmax(logits, dim=1)
             
             # 计算准确率
             correct_pixels += (preds == masks).sum().item()
             total_pixels += masks.numel()
 
-            B = imgs.size(0)
-            for b in range(B):
-                gt = masks[b]
-                pr = preds[b]
-
-                gt_sum = gt.sum().item()
-                pr_sum = pr.sum().item()
-
-                if gt_sum == 0 and pr_sum == 0:
-                    continue
-
-                inter = (gt * pr).sum().item()
-                union = (gt + pr - gt * pr).sum().item()
-
-                total_inter += inter
-                total_union += union
-
-                total_dice_inter += 2 * inter
-                total_dice_sum += (gt_sum + pr_sum)
-                valid_iou_samples += 1
+            for cls_id in range(1, num_classes):
+                pred_c = preds == cls_id
+                mask_c = masks == cls_id
+                inter = (pred_c & mask_c).sum()
+                union = (pred_c | mask_c).sum()
+                total_inter[cls_id] += inter
+                total_union[cls_id] += union
+                total_dice_inter[cls_id] += 2 * inter
+                total_dice_sum[cls_id] += pred_c.sum() + mask_c.sum()
 
     avg_loss = total_loss / len(loader.dataset)
     accuracy = correct_pixels / total_pixels
     
-    if valid_iou_samples > 0:
-        mean_iou = total_inter / (total_union + 1e-6)
-        mean_dice = total_dice_inter / (total_dice_sum + 1e-6)
-    else:
-        mean_iou = 0.0
-        mean_dice = 0.0
+    valid_classes = list(range(1, num_classes))
+    iou_per_class = total_inter[valid_classes] / (total_union[valid_classes] + 1e-6)
+    dice_per_class = total_dice_inter[valid_classes] / (total_dice_sum[valid_classes] + 1e-6)
+    mean_iou = iou_per_class.mean().item() if len(valid_classes) > 0 else 0.0
+    mean_dice = dice_per_class.mean().item() if len(valid_classes) > 0 else 0.0
 
-    return avg_loss, accuracy, mean_iou, mean_dice
+    return avg_loss, accuracy, mean_iou, mean_dice, iou_per_class.detach().cpu().tolist(), dice_per_class.detach().cpu().tolist()
 
 
 def main():
-    img_dir = "data/images"
-    mask_dir = "data/masks"
-    output_dir = "outputs"
+    parser = argparse.ArgumentParser(description="FCNResNet50 语义分割训练/评估")
+    parser.add_argument("--data_source", choices=["data_poly", "mask_dir"], default="data_poly")
+    parser.add_argument("--data_poly_dir", type=str, default="data_poly")
+    parser.add_argument("--img_dir", type=str, default="data/images")
+    parser.add_argument("--mask_dir", type=str, default="data/masks")
+    parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--val_ratio", type=float, default=0.2)
+    args = parser.parse_args()
+
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    img_size = (256, 256)
-    batch_size = 4
-    num_epochs = 10
-    lr = 1e-4          # FCN + ResNet 更大，lr 稍微小一点
-    val_ratio = 0.2
-    threshold = 0.3
+    img_size = (int(args.img_size), int(args.img_size))
+    batch_size = int(args.batch_size)
+    num_epochs = int(args.epochs)
+    lr = float(args.lr)          # FCN + ResNet 更大，lr 稍微小一点
+    val_ratio = float(args.val_ratio)
 
     device = torch.device(
         "cuda" if torch.cuda.is_available() else
@@ -189,16 +173,29 @@ def main():
     print("Using device:", device)
 
     # 数据集 & 划分
-    full_dataset = CrackDataset(img_dir, mask_dir, img_size=img_size)
-    pos_weight = compute_pos_weight(full_dataset, device=device)
+    if args.data_source == "data_poly":
+        full_dataset = CocoPolygonSegDataset(args.data_poly_dir, img_size=img_size)
+    else:
+        full_dataset = CrackDataset(args.img_dir, args.mask_dir, img_size=img_size)
+    class_weights = compute_class_weights(full_dataset, full_dataset.num_classes, device=device)
 
-    val_size = int(len(full_dataset) * val_ratio)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42),
-    )
+    if len(full_dataset) < 2:
+        train_dataset = full_dataset
+        val_dataset = full_dataset
+        train_size = len(full_dataset)
+        val_size = len(full_dataset)
+    else:
+        val_size = int(len(full_dataset) * val_ratio)
+        if val_size < 1:
+            val_size = 1
+        if val_size >= len(full_dataset):
+            val_size = len(full_dataset) - 1
+        train_size = len(full_dataset) - val_size
+        train_dataset, val_dataset = random_split(
+            full_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
 
     print(f"总样本数: {len(full_dataset)}, 训练集: {train_size}, 验证集: {val_size}")
 
@@ -206,7 +203,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # 模型 & 优化器
-    model = FCNResNet50Binary(pretrained=True).to(device)
+    model = FCNResNet50(num_classes=full_dataset.num_classes, pretrained=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     best_val_iou = 0.0
@@ -222,10 +219,10 @@ def main():
     for epoch in range(1, num_epochs + 1):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, device,
-            pos_weight=pos_weight, dice_weight=1.0, bce_weight=1.0, threshold=threshold
+            class_weights=class_weights
         )
-        val_loss, val_acc, val_iou, val_dice = evaluate(
-            model, val_loader, device, pos_weight=pos_weight, threshold=threshold
+        val_loss, val_acc, val_iou, val_dice, iou_per_class, dice_per_class = evaluate(
+            model, val_loader, device, full_dataset.num_classes, class_weights=class_weights
         )
 
         # 记录训练曲线数据
@@ -234,6 +231,14 @@ def main():
         val_losses.append(val_loss)
         val_accuracies.append(val_acc)
 
+        class_names = getattr(full_dataset, "class_names", [])
+        per_class_parts = []
+        for idx in range(len(iou_per_class)):
+            name = class_names[idx] if idx < len(class_names) else f"C{idx+1}"
+            per_class_parts.append(
+                f"{name} IoU:{iou_per_class[idx]:.4f} Dice:{dice_per_class[idx]:.4f}"
+            )
+        per_class_msg = " ".join(per_class_parts)
         print(
             f"Epoch {epoch}/{num_epochs} "
             f"- train_loss: {train_loss:.4f} "
@@ -241,7 +246,8 @@ def main():
             f"- val_loss: {val_loss:.4f} "
             f"- val_acc: {val_acc:.4f} "
             f"- val_IoU: {val_iou:.4f} "
-            f"- val_Dice: {val_dice:.4f}"
+            f"- val_Dice: {val_dice:.4f} "
+            f"- {per_class_msg}"
         )
 
         if val_iou > best_val_iou:
@@ -262,7 +268,7 @@ def main():
     torch.save(model.state_dict(), last_ckpt_path)
     print("最终 FCN 模型已保存到:", last_ckpt_path)
 
-    model = FCNResNet50Binary(pretrained=False).to(device)
+    model = FCNResNet50(num_classes=full_dataset.num_classes, pretrained=False).to(device)
     model.load_state_dict(torch.load(last_ckpt_path, map_location=device))
 
     # 可视化
@@ -272,7 +278,6 @@ def main():
         img_size=img_size,
         out_path=vis_path,
         num_samples=5,
-        threshold=threshold
     )
 
 
