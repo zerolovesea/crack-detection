@@ -1,0 +1,10 @@
+torch>=2.3
+torchvision>=0.18
+numpy>=1.26
+Pillow>=10.0
+matplotlib>=3.8
+tqdm>=4.66
+
+# Optional:
+# segmentation-models-pytorch>=0.3.3
+# transformers>=4.40

@@ -5,9 +5,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, random_split
 import matplotlib.pyplot as plt
-from src.dataset import CrackDataset, CocoPolygonSegDataset
-from src.model import FCNResNet50
-from src.utils import compute_class_weights, visualize_predictions
+from v1.src.dataset import CrackDataset, CocoPolygonSegDataset
+from v1.src.model import FCNResNet50
+from v1.src.utils import compute_class_weights, visualize_predictions
 
 
 def plot_training_curves(train_losses, train_accuracies, val_losses=None, val_accuracies=None, save_dir='./', filename='training_curves.png'):

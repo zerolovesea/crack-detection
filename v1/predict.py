@@ -3,8 +3,8 @@ import torch
 import numpy as np
 import cv2
 from PIL import Image
-from src.model import FCNResNet50
-from src.utils import get_class_colors
+from v1.src.model import FCNResNet50
+from v1.src.utils import get_class_colors
 
 
 def predict_and_visualize(
